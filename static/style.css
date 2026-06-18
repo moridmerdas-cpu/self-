@@ -1,498 +1,1146 @@
-import asyncio
-import os
-import threading
-from functools import wraps
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-from telethon.errors import (
-    SessionPasswordNeededError,
-    PhoneCodeInvalidError,
-    PhoneCodeExpiredError,
-    FloodWaitError,
-)
-import database as db
-import config
-from bot import bot_manager
-
-app = Flask(__name__)
-app.secret_key = config.SECRET_KEY
-
-# ─── پایگاه داده را همیشه هنگام بارگذاری ماژول بساز ──────────────────────────
-db.init_db()
-
-
-@app.errorhandler(500)
-def server_error(e):
-    return jsonify({"ok": False, "error": f"خطای داخلی سرور: {str(e)}"}), 500
-
-
-@app.errorhandler(Exception)
-def unhandled_exception(e):
-    return jsonify({"ok": False, "error": f"خطای غیرمنتظره: {str(e)}"}), 500
-
-# ─── event loop جداگانه برای Telethon ────────────────────────────────────────
-_loop = None
-_login_clients = {}   # {owner_id: TelegramClient} برای فرایند لاگین
-_phone_hashes = {}    # {owner_id: phone_code_hash}
-_phone_numbers = {}   # {owner_id: phone}
-
-
-def get_loop():
-    global _loop
-    if _loop is None or _loop.is_closed():
-        _loop = asyncio.new_event_loop()
-        t = threading.Thread(target=_loop.run_forever, daemon=True)
-        t.start()
-    return _loop
-
-
-def run_async(coro):
-    return asyncio.run_coroutine_threadsafe(coro, get_loop()).result(timeout=30)
-
-
-# ─── احراز هویت پنل ───────────────────────────────────────────────────────────
-def login_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not session.get("owner_id"):
-            if request.path.startswith("/api/"):
-                return jsonify({"ok": False, "error": "وارد نشده‌اید"}), 401
-            return redirect(url_for("panel_login_page"))
-        return f(*args, **kwargs)
-    return decorated
-
-
-def owner_id() -> int:
-    return int(session["owner_id"])
-
-
-# ─── keep-alive ───────────────────────────────────────────────────────────────
-@app.route("/ping")
-def ping():
-    return "pong", 200
-
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok", "bot": config.BOT_NAME}), 200
-
-
-# ─── ثبت‌نام / ورود پنل ───────────────────────────────────────────────────────
-@app.route("/")
-@login_required
-def index():
-    if db.get_setting(owner_id(), "logged_in") != "1":
-        return redirect(url_for("tg_login_page"))
-    return render_template(
-        "panel.html",
-        page="panel",
-        username=db.get_account(owner_id())["username"],
-        owner_id=owner_id(),
-    )
-
-
-@app.route("/register", methods=["GET"])
-def register_page():
-    if session.get("owner_id"):
-        return redirect(url_for("index"))
-    return render_template("panel.html", page="register")
-
-
-@app.route("/panel-login", methods=["GET"])
-def panel_login_page():
-    if session.get("owner_id"):
-        return redirect(url_for("index"))
-    has_accounts = db.account_exists()
-    return render_template("panel.html", page="panel_login",
-                           has_accounts=has_accounts)
-
-
-@app.route("/api/register", methods=["POST"])
-def api_register():
-    try:
-        data = request.json or {}
-        username = data.get("username", "").strip()
-        password = data.get("password", "").strip()
-        if not username or not password:
-            return jsonify({"ok": False, "error": "یوزرنیم و رمز الزامی هستند"}), 400
-        if len(username) < 3:
-            return jsonify({"ok": False, "error": "یوزرنیم باید حداقل ۳ کاراکتر باشد"}), 400
-        if len(password) < 6:
-            return jsonify({"ok": False, "error": "رمز باید حداقل ۶ کاراکتر باشد"}), 400
-        new_id = db.create_account(username, password)
-        if new_id is None:
-            # شاید قبلاً ثبت شده، ولی نیمه‌کاره — بررسی کن
-            existing = db.get_account_by_username(username)
-            if existing:
-                return jsonify({"ok": False, "error": "این یوزرنیم قبلاً ثبت شده"}), 409
-            return jsonify({"ok": False, "error": "خطا در ایجاد حساب — لطفاً مجدداً تلاش کنید"}), 500
-        db.init_user_settings(new_id)
-        session["owner_id"] = new_id
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"خطای سرور: {str(e)}"}), 500
-
-
-@app.route("/api/panel-login", methods=["POST"])
-def api_panel_login():
-    data = request.json or {}
-    username = data.get("username", "").strip()
-    password = data.get("password", "").strip()
-    if not username or not password:
-        return jsonify({"ok": False, "error": "یوزرنیم و رمز الزامی هستند"}), 400
-    uid = db.verify_account(username, password)
-    if uid is None:
-        return jsonify({"ok": False, "error": "یوزرنیم یا رمز اشتباه است"}), 401
-    session["owner_id"] = uid
-    # اگه قبلاً لاگین بوده بات رو استارت کن (بدون کسر توکن)
-    if db.get_setting(uid, "logged_in") == "1":
-        bot_manager.start(uid, get_loop(), check_tokens=False)
-    return jsonify({"ok": True})
-
-
-@app.route("/api/panel-logout", methods=["POST"])
-@login_required
-def api_panel_logout():
-    session.pop("owner_id", None)
-    return jsonify({"ok": True})
-
-
-# ─── لاگین تلگرام ────────────────────────────────────────────────────────────
-@app.route("/tg-login")
-@login_required
-def tg_login_page():
-    return render_template("panel.html", page="tg_login",
-                           username=db.get_account(owner_id())["username"])
-
-
-@app.route("/api/login/send_code", methods=["POST"])
-@login_required
-def send_code():
-    oid = owner_id()
-    data = request.json or {}
-    phone = data.get("phone", "").strip()
-    if not phone:
-        return jsonify({"ok": False, "error": "شماره تلفن الزامی است"}), 400
-    if not config.API_ID or not config.API_HASH:
-        return jsonify({"ok": False, "error": "API_ID و API_HASH تنظیم نشده‌اند"}), 400
-
-    async def _send():
-        cl = TelegramClient(StringSession(), config.API_ID, config.API_HASH)
-        await cl.connect()
-        result = await cl.send_code_request(phone)
-        # ذخیره session موقت در دیتابیس — مقاوم در برابر restart سرور
-        partial_sess = cl.session.save()
-        await cl.disconnect()
-        db.set_setting(oid, "_login_phone", phone)
-        db.set_setting(oid, "_login_phone_hash", result.phone_code_hash)
-        db.set_setting(oid, "_login_partial_session", partial_sess)
-        # همچنین در حافظه برای سرعت
-        _phone_hashes[oid] = result.phone_code_hash
-        _phone_numbers[oid] = phone
-        return {"ok": True}
-
-    try:
-        return jsonify(run_async(_send()))
-    except FloodWaitError as e:
-        return jsonify({"ok": False, "error": f"محدودیت: {e.seconds} ثانیه صبر کنید"}), 429
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/api/login/verify_code", methods=["POST"])
-@login_required
-def verify_code():
-    oid = owner_id()
-    data = request.json or {}
-    code = data.get("code", "").strip()
-    if not code:
-        return jsonify({"ok": False, "error": "کد الزامی است"}), 400
-
-    # اول از حافظه، اگر نبود از دیتابیس بخوان
-    phone = _phone_numbers.get(oid) or db.get_setting(oid, "_login_phone")
-    ph = _phone_hashes.get(oid) or db.get_setting(oid, "_login_phone_hash")
-    partial_sess = db.get_setting(oid, "_login_partial_session")
-
-    if not phone or not ph or not partial_sess:
-        return jsonify({"ok": False, "error": "ابتدا کد ارسال کنید (مجدداً شماره خود را وارد کنید)"}), 400
-
-    async def _verify():
-        cl = TelegramClient(StringSession(partial_sess), config.API_ID, config.API_HASH)
-        await cl.connect()
-        await cl.sign_in(phone=phone, code=code, phone_code_hash=ph)
-        me = await cl.get_me()
-        sess = cl.session.save()
-        await cl.disconnect()
-        # پاک کردن داده‌های موقت
-        _login_clients.pop(oid, None)
-        _phone_hashes.pop(oid, None)
-        _phone_numbers.pop(oid, None)
-        db.set_setting(oid, "_login_phone", "")
-        db.set_setting(oid, "_login_phone_hash", "")
-        db.set_setting(oid, "_login_partial_session", "")
-        # ذخیره session نهایی
-        db.set_setting(oid, "session_data", sess)
-        db.set_setting(oid, "logged_in", "1")
-        db.save_telegram_user_id(oid, me.id)
-        return {"ok": True}
-
-    try:
-        result = run_async(_verify())
-        bot_manager.start(oid, get_loop(), check_tokens=False)
-        return jsonify(result)
-    except SessionPasswordNeededError:
-        # session موقت رو نگه دار تا 2FA انجام بشه
-        return jsonify({"ok": False, "need_2fa": True}), 200
-    except (PhoneCodeInvalidError, PhoneCodeExpiredError):
-        return jsonify({"ok": False, "error": "کد اشتباه یا منقضی شده"}), 400
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/api/login/verify_2fa", methods=["POST"])
-@login_required
-def verify_2fa():
-    oid = owner_id()
-    data = request.json or {}
-    password = data.get("password", "").strip()
-    if not password:
-        return jsonify({"ok": False, "error": "رمز دو مرحله‌ای الزامی است"}), 400
-
-    phone = _phone_numbers.get(oid) or db.get_setting(oid, "_login_phone")
-    ph = _phone_hashes.get(oid) or db.get_setting(oid, "_login_phone_hash")
-    partial_sess = db.get_setting(oid, "_login_partial_session")
-    code = data.get("_code", "")  # کد قبلی که با 2FA همراه بود
-
-    if not partial_sess:
-        return jsonify({"ok": False, "error": "ابتدا کد تأیید را وارد کنید"}), 400
-
-    async def _verify():
-        cl = TelegramClient(StringSession(partial_sess), config.API_ID, config.API_HASH)
-        await cl.connect()
-        await cl.sign_in(password=password)
-        me = await cl.get_me()
-        sess = cl.session.save()
-        await cl.disconnect()
-        _login_clients.pop(oid, None)
-        _phone_hashes.pop(oid, None)
-        _phone_numbers.pop(oid, None)
-        db.set_setting(oid, "_login_phone", "")
-        db.set_setting(oid, "_login_phone_hash", "")
-        db.set_setting(oid, "_login_partial_session", "")
-        db.set_setting(oid, "session_data", sess)
-        db.set_setting(oid, "logged_in", "1")
-        db.save_telegram_user_id(oid, me.id)
-        return {"ok": True}
-
-    try:
-        result = run_async(_verify())
-        bot_manager.start(oid, get_loop(), check_tokens=False)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.route("/api/logout", methods=["POST"])
-@login_required
-def tg_logout():
-    oid = owner_id()
-    bot_manager.stop(oid)
-    db.set_setting(oid, "logged_in", "0")
-    db.set_setting(oid, "session_data", "")
-    return jsonify({"ok": True})
-
-
-# ─── روشن / خاموش کردن سلف ───────────────────────────────────────────────────
-@app.route("/api/start", methods=["POST"])
-@login_required
-def start_bot_api():
-    oid = owner_id()
-    ok = bot_manager.start(oid, get_loop(), check_tokens=True)
-    if ok:
-        db.set_setting(oid, "self_bot_active", "1")
-        # تشخیص مالک برای پیام متفاوت
-        tg_id = db.get_telegram_id_by_owner(oid)
-        if tg_id == config.OWNER_TG_ID:
-            msg = "✅ سلف روشن شد — دسترسی رایگان مالک ♾️"
-        else:
-            hours = config.SESSION_HOURS
-            tokens = config.TOKENS_PER_SESSION
-            msg = f"✅ سلف روشن شد — {tokens} توکن کسر شد — {hours} ساعت فعال است"
-        return jsonify({"ok": True, "message": msg})
-    else:
-        balance = db.get_token_balance(oid)
-        return jsonify({
-            "ok": False,
-            "error": f"توکن کافی ندارید! موجودی: {balance} — برای روشن کردن {config.TOKENS_PER_SESSION} توکن لازم است.",
-        })
-
-
-@app.route("/api/stop", methods=["POST"])
-@login_required
-def stop_bot_api():
-    oid = owner_id()
-    bot_manager.stop(oid)
-    db.set_setting(oid, "self_bot_active", "0")
-    return jsonify({"ok": True})
-
-
-# ─── API تنظیمات ─────────────────────────────────────────────────────────────
-@app.route("/api/settings", methods=["GET"])
-@login_required
-def get_settings():
-    oid = owner_id()
-    keys = [
-        "self_bot_active", "secretary_active", "anti_delete_active",
-        "anti_link_active", "auto_seen_active", "auto_reaction_active",
-        "private_lock_active", "enemy_reply_active", "auto_save_media",
-        "clock_name_active", "clock_bio_active", "selected_font",
-        "secretary_message", "auto_reaction_emoji", "spam_delay",
-    ]
-    return jsonify({k: db.get_setting(oid, k) for k in keys})
-
-
-@app.route("/api/settings", methods=["POST"])
-@login_required
-def update_settings():
-    oid = owner_id()
-    data = request.json or {}
-    allowed = ["secretary_message", "auto_reaction_emoji", "selected_font", "spam_delay", "spam_count"]
-    for k in allowed:
-        if k in data:
-            db.set_setting(oid, k, data[k])
-    return jsonify({"ok": True})
-
-
-@app.route("/api/toggle/<key>", methods=["POST"])
-@login_required
-def toggle(key):
-    allowed = [
-        "self_bot_active", "secretary_active", "anti_delete_active",
-        "anti_link_active", "auto_seen_active", "auto_reaction_active",
-        "private_lock_active", "enemy_reply_active", "auto_save_media",
-        "clock_name_active", "clock_bio_active",
-    ]
-    if key not in allowed:
-        return jsonify({"ok": False, "error": "کلید مجاز نیست"}), 400
-    new_state = db.toggle_setting(owner_id(), key)
-    return jsonify({"ok": True, "active": new_state})
-
-
-# ─── API توکن ─────────────────────────────────────────────────────────────────
-@app.route("/api/tokens", methods=["GET"])
-@login_required
-def get_tokens():
-    import telegram_bot as tb
-    oid = owner_id()
-    stats = db.get_token_stats(oid)
-    stats["ref_count"] = db.get_referral_count(oid)
-    stats["bot_username"] = tb.BOT_USERNAME or ""
-    stats["token_system_active"] = bool(config.BOT_TOKEN)
-    stats["tokens_per_session"] = config.TOKENS_PER_SESSION
-    stats["session_hours"] = config.SESSION_HOURS
-    stats["daily_gift"] = config.DAILY_TOKEN_GIFT
-    stats["referral_tokens"] = config.REFERRAL_TOKENS
-    return jsonify(stats)
-
-
-@app.route("/api/tokens/daily", methods=["POST"])
-@login_required
-def claim_daily():
-    oid = owner_id()
-    success, message = db.claim_daily_token(oid)
-    return jsonify({"ok": success, "message": message})
-
-
-# ─── API لیست‌ها ──────────────────────────────────────────────────────────────
-@app.route("/api/enemies", methods=["GET"])
-@login_required
-def get_enemies():
-    return jsonify(db.get_enemies(owner_id()))
-
-
-@app.route("/api/enemies", methods=["POST"])
-@login_required
-def add_enemy():
-    oid = owner_id()
-    data = request.json or {}
-    uid = data.get("user_id")
-    if not uid:
-        return jsonify({"ok": False, "error": "آیدی کاربر الزامی است"}), 400
-    db.add_enemy(oid, int(uid), data.get("username"), data.get("name"))
-    return jsonify({"ok": True})
-
-
-@app.route("/api/enemies/<int:uid>", methods=["DELETE"])
-@login_required
-def del_enemy(uid):
-    db.remove_enemy(owner_id(), uid)
-    return jsonify({"ok": True})
-
-
-@app.route("/api/enemies/clear", methods=["POST"])
-@login_required
-def clear_enemies_api():
-    db.clear_enemies(owner_id())
-    return jsonify({"ok": True})
-
-
-@app.route("/api/friends", methods=["GET"])
-@login_required
-def get_friends():
-    return jsonify(db.get_friends(owner_id()))
-
-
-@app.route("/api/friends", methods=["POST"])
-@login_required
-def add_friend():
-    oid = owner_id()
-    data = request.json or {}
-    uid = data.get("user_id")
-    if not uid:
-        return jsonify({"ok": False, "error": "آیدی کاربر الزامی است"}), 400
-    db.add_friend(oid, int(uid), data.get("username"), data.get("name"))
-    return jsonify({"ok": True})
-
-
-@app.route("/api/friends/<int:uid>", methods=["DELETE"])
-@login_required
-def del_friend(uid):
-    db.remove_friend(owner_id(), uid)
-    return jsonify({"ok": True})
-
-
-@app.route("/api/friends/clear", methods=["POST"])
-@login_required
-def clear_friends_api():
-    db.clear_friends(owner_id())
-    return jsonify({"ok": True})
-
-
-@app.route("/api/deleted_messages", methods=["GET"])
-@login_required
-def deleted_messages():
-    return jsonify(db.get_deleted_messages(owner_id(), 50))
-
-
-@app.route("/api/bot_status", methods=["GET"])
-@login_required
-def bot_status():
-    oid = owner_id()
-    running = bot_manager.is_running(oid)
-    logged_in = db.get_setting(oid, "logged_in") == "1"
-    return jsonify({"running": running, "logged_in": logged_in})
-
-
-# ─── اجرا ────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    db.init_db()
-    # استارت ربات توکن
-    from telegram_bot import start_token_bot
-    start_token_bot()
-    # استارت بات برای همه کاربران لاگین‌شده
-    loop = get_loop()
-    for oid in db.get_all_logged_in_users():
-        bot_manager.start(oid, loop, check_tokens=False)
-        print(f"🚀 بات کاربر {oid} استارت شد.")
-    app.run(host="0.0.0.0", port=config.PORT, debug=False)
+/* ─── AMEL SELF55 — Cyberpunk Dark Panel ─── */
+@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&display=swap');
+
+:root {
+  --bg: #080a12;
+  --bg2: #0e1118;
+  --bg3: #131825;
+  --card: #141828;
+  --card2: #1a2035;
+  --border: #1e2640;
+  --border2: #252d45;
+  --accent: #6c4fff;
+  --accent2: #8b6fff;
+  --accent-glow: rgba(108,79,255,0.3);
+  --green: #1db954;
+  --green-glow: rgba(29,185,84,0.3);
+  --red: #e53935;
+  --red-glow: rgba(229,57,53,0.3);
+  --blue: #2979ff;
+  --blue-glow: rgba(41,121,255,0.3);
+  --yellow: #f59e0b;
+  --text: #e8eaf0;
+  --text2: #8892aa;
+  --text3: #4a5270;
+  --purple: #c4b5fd;
+  --radius: 12px;
+  --radius-sm: 8px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 15px; scroll-behavior: smooth; }
+
+body {
+  font-family: 'Vazirmatn', Tahoma, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  direction: rtl;
+  min-height: 100vh;
+  line-height: 1.6;
+}
+
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+
+/* ══════════════════════════════════════
+   AUTH PAGES
+══════════════════════════════════════ */
+.auth-bg {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(ellipse at 30% 20%, rgba(108,79,255,0.15) 0%, transparent 60%),
+              radial-gradient(ellipse at 70% 80%, rgba(41,121,255,0.1) 0%, transparent 60%),
+              linear-gradient(160deg, #080a12 0%, #0d0e1c 50%, #080a12 100%);
+  padding: 20px;
+  position: relative;
+  overflow: hidden;
+}
+
+.auth-particles { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.auth-particles span {
+  position: absolute;
+  border-radius: 50%;
+  animation: ap-float linear infinite;
+  opacity: 0;
+}
+.auth-particles span:nth-child(1) { width:70px; height:70px; background:rgba(108,79,255,.12); left:8%;   animation-duration:18s; animation-delay:0s;   bottom:-70px; }
+.auth-particles span:nth-child(2) { width:25px; height:25px; background:rgba(168,85,247,.2);  left:22%;  animation-duration:13s; animation-delay:2s;   bottom:-25px; }
+.auth-particles span:nth-child(3) { width:50px; height:50px; background:rgba(41,121,255,.12); left:38%;  animation-duration:20s; animation-delay:4s;   bottom:-50px; }
+.auth-particles span:nth-child(4) { width:18px; height:18px; background:rgba(108,79,255,.25); left:55%;  animation-duration:11s; animation-delay:1s;   bottom:-18px; }
+.auth-particles span:nth-child(5) { width:40px; height:40px; background:rgba(168,85,247,.1);  left:68%;  animation-duration:15s; animation-delay:3s;   bottom:-40px; }
+.auth-particles span:nth-child(6) { width:60px; height:60px; background:rgba(29,185,84,.08);  left:82%;  animation-duration:22s; animation-delay:0.5s; bottom:-60px; }
+.auth-particles span:nth-child(7) { width:22px; height:22px; background:rgba(108,79,255,.2);  left:4%;   animation-duration:14s; animation-delay:5s;   bottom:-22px; }
+.auth-particles span:nth-child(8) { width:85px; height:85px; background:rgba(41,121,255,.06); left:48%;  animation-duration:25s; animation-delay:2.5s; bottom:-85px; }
+
+@keyframes ap-float {
+  0%   { transform: translateY(0) rotate(0); opacity: 0; }
+  10%  { opacity: 1; }
+  90%  { opacity: 0.5; }
+  100% { transform: translateY(-110vh) rotate(720deg); opacity: 0; }
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 430px;
+  background: rgba(14,17,24,0.9);
+  backdrop-filter: blur(24px);
+  border: 1px solid rgba(108,79,255,0.2);
+  border-radius: 24px;
+  padding: 40px 36px;
+  box-shadow: 0 24px 64px rgba(0,0,0,0.6), 0 0 80px rgba(108,79,255,0.08);
+  animation: card-in 0.6s cubic-bezier(0.34,1.4,0.64,1) both;
+  position: relative;
+  z-index: 2;
+}
+
+@keyframes card-in { from { opacity:0; transform:translateY(30px) scale(0.97); } to { opacity:1; transform:none; } }
+
+.auth-logo { text-align: center; margin-bottom: 28px; }
+.auth-logo-icon {
+  width: 72px; height: 72px;
+  background: linear-gradient(135deg, var(--accent), #a855f7);
+  border-radius: 20px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 34px;
+  margin: 0 auto 14px;
+  box-shadow: 0 8px 32px var(--accent-glow);
+}
+.auth-title { font-size: 26px; font-weight: 800; color: var(--text); letter-spacing: 1px; }
+.auth-title-accent { color: var(--accent2); }
+.auth-sub { font-size: 13px; color: var(--text2); margin-top: 5px; }
+
+.auth-form { display: flex; flex-direction: column; gap: 14px; }
+.auth-field label { display: block; font-size: 12px; font-weight: 600; color: var(--text2); margin-bottom: 6px; }
+.auth-field input, .auth-input {
+  width: 100%;
+  padding: 12px 16px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.auth-field input:focus, .auth-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.auth-btn {
+  width: 100%;
+  padding: 13px;
+  background: linear-gradient(135deg, var(--accent), #a855f7);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s;
+  letter-spacing: 0.5px;
+}
+.auth-btn:hover { filter: brightness(1.12); transform: translateY(-1px); box-shadow: 0 8px 24px var(--accent-glow); }
+.auth-btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+
+.auth-error {
+  background: rgba(229,57,53,0.1);
+  border: 1px solid rgba(229,57,53,0.25);
+  color: #ff6b6b;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  text-align: center;
+}
+.auth-link-text { text-align: center; font-size: 13px; color: var(--text2); }
+.auth-link-text a { color: var(--accent2); text-decoration: none; font-weight: 600; }
+
+/* TG Login Steps */
+.tg-steps-bar { display: flex; align-items: center; justify-content: center; gap: 0; margin: 20px 0 28px; }
+.tg-step-dot {
+  width: 34px; height: 34px;
+  border-radius: 50%;
+  background: var(--bg3);
+  border: 2px solid var(--border2);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700; color: var(--text2);
+  transition: all 0.3s;
+}
+.tg-step-dot.active { background: var(--accent); border-color: var(--accent); color: #fff; box-shadow: 0 0 16px var(--accent-glow); }
+.tg-step-dot.done { background: var(--green); border-color: var(--green); color: #fff; }
+.tg-step-line { flex: 1; height: 2px; background: var(--border2); transition: background 0.3s; max-width: 60px; }
+.tg-step-line.active { background: var(--accent); }
+.tg-step { display: none; flex-direction: column; gap: 14px; }
+.tg-step.active { display: flex; }
+.tg-step-label { font-size: 14px; font-weight: 600; color: var(--text); text-align: center; }
+
+/* ══════════════════════════════════════
+   PANEL LAYOUT
+══════════════════════════════════════ */
+.panel-layout {
+  display: flex;
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+/* ─── سایدبار ─── */
+.sidebar {
+  width: 210px;
+  background: var(--bg2);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  top: 0; right: 0; bottom: 0;
+  z-index: 100;
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  overflow-y: auto;
+  box-shadow: none;
+}
+
+.sb-brand {
+  padding: 20px 16px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.sb-brand-icon {
+  width: 40px; height: 40px;
+  background: linear-gradient(135deg, #4c1d95, #6c4fff);
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  box-shadow: 0 4px 16px rgba(108,79,255,0.4);
+}
+.sb-brand-name {
+  font-size: 16px;
+  font-weight: 800;
+  color: var(--text);
+  letter-spacing: 1px;
+}
+.sb-brand-name span { color: var(--accent2); }
+.sb-brand-sub {
+  font-size: 8px;
+  color: var(--text3);
+  font-weight: 500;
+  letter-spacing: 0.5px;
+  margin-top: 2px;
+  line-height: 1.3;
+}
+
+.sb-nav {
+  flex: 1;
+  padding: 10px 0;
+  overflow-y: auto;
+}
+
+.sb-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 18px;
+  cursor: pointer;
+  color: var(--text2);
+  font-size: 13px;
+  font-weight: 500;
+  border-right: 3px solid transparent;
+  transition: all 0.2s;
+  text-decoration: none;
+  user-select: none;
+}
+.sb-item:hover { background: rgba(108,79,255,0.06); color: var(--text); }
+.sb-item.active {
+  background: rgba(108,79,255,0.12);
+  color: var(--purple);
+  border-right-color: var(--accent);
+}
+.sb-icon { font-size: 15px; width: 18px; text-align: center; flex-shrink: 0; }
+
+.sb-footer {
+  padding: 14px 16px;
+  border-top: 1px solid var(--border);
+}
+.sb-creator {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.sb-version {
+  font-size: 11px;
+  color: var(--text3);
+  text-align: center;
+  margin-bottom: 10px;
+}
+.sb-logout {
+  width: 100%;
+  padding: 9px;
+  background: rgba(229,57,53,0.08);
+  border: 1px solid rgba(229,57,53,0.2);
+  color: #ff6b6b;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  transition: all 0.2s;
+}
+.sb-logout:hover { background: rgba(229,57,53,0.18); }
+.sb-logout-red { background: rgba(229,57,53,0.12); }
+
+/* ─── ناحیه اصلی ─── */
+.main-area {
+  flex: 1;
+  margin-right: 210px;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+/* ─── هدر پنل ─── */
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 20px 28px;
+  background: linear-gradient(135deg, #0c0e1a 0%, #111428 50%, #0c0e1a 100%);
+  border-bottom: 1px solid var(--border);
+  position: relative;
+  overflow: hidden;
+  flex-wrap: wrap;
+}
+.panel-header::before {
+  content: "";
+  position: absolute;
+  top: -40px; right: -40px;
+  width: 300px; height: 300px;
+  background: radial-gradient(circle, rgba(108,79,255,0.12), transparent 70%);
+  pointer-events: none;
+}
+.panel-header::after {
+  content: "";
+  position: absolute;
+  bottom: -40px; left: 100px;
+  width: 200px; height: 200px;
+  background: radial-gradient(circle, rgba(41,121,255,0.08), transparent 70%);
+  pointer-events: none;
+}
+
+.ph-left {}
+.ph-title {
+  font-size: 28px;
+  font-weight: 800;
+  color: var(--text);
+  letter-spacing: 2px;
+  text-shadow: 0 0 30px rgba(108,79,255,0.4);
+}
+.ph-title span { color: #f59e0b; text-shadow: 0 0 20px rgba(245,158,11,0.4); }
+.ph-sub { font-size: 12px; color: var(--text2); margin-top: 3px; letter-spacing: 1px; }
+
+.ph-robot {
+  font-size: 64px;
+  opacity: 0.9;
+  filter: drop-shadow(0 0 20px rgba(108,79,255,0.5));
+  flex-shrink: 0;
+}
+
+.ph-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.ph-user { display: flex; align-items: center; gap: 10px; flex-direction: row-reverse; }
+.ph-avatar {
+  width: 38px; height: 38px;
+  background: linear-gradient(135deg, var(--accent), #a855f7);
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 16px; font-weight: 700; color: #fff;
+  box-shadow: 0 4px 16px var(--accent-glow);
+}
+.ph-username { font-size: 14px; font-weight: 700; color: var(--text); text-align: right; }
+.ph-welcome { font-size: 11px; color: var(--text2); text-align: right; }
+
+.ph-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  flex-direction: row-reverse;
+}
+.ph-status-label { color: var(--text2); }
+.ph-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--text3);
+  transition: all 0.3s;
+}
+.ph-dot-on { background: var(--green); box-shadow: 0 0 10px var(--green); animation: blink-g 2s infinite; }
+.ph-dot-off { background: var(--red); box-shadow: 0 0 10px var(--red); animation: blink-r 2s infinite; }
+@keyframes blink-g { 0%,100%{box-shadow:0 0 8px var(--green);} 50%{box-shadow:0 0 18px var(--green);} }
+@keyframes blink-r { 0%,100%{box-shadow:0 0 8px var(--red);} 50%{box-shadow:0 0 16px var(--red);} }
+
+.ph-clock {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  direction: ltr;
+}
+.ph-date { font-size: 11px; color: var(--text2); text-align: right; }
+
+/* ─── سکشن‌ها ─── */
+.section { flex: 1; padding: 24px 28px; }
+.sec-header { margin-bottom: 20px; }
+.sec-header h2 { font-size: 18px; font-weight: 700; color: var(--text); }
+
+/* ─── گرید داشبورد ─── */
+.dash-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+@media (max-width: 1100px) { .dash-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 700px)  { .dash-grid { grid-template-columns: 1fr; } }
+
+/* ─── کارت داشبورد ─── */
+.dash-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.dash-card:hover {
+  border-color: var(--border2);
+  box-shadow: 0 4px 24px rgba(0,0,0,0.3);
+}
+
+.dc-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  background: rgba(255,255,255,0.03);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+.dc-icon { font-size: 14px; }
+
+.dc-body { padding: 14px 14px; display: flex; flex-direction: column; gap: 10px; }
+.dc-toggles { gap: 8px; }
+
+/* دکمه‌های روشن/خاموش */
+.dc-btn-row { display: flex; gap: 8px; }
+.dc-btn {
+  flex: 1;
+  padding: 9px 8px;
+  border-radius: 8px;
+  border: none;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.dc-green {
+  background: linear-gradient(135deg, #1a6636, #1db954);
+  color: #fff;
+  box-shadow: 0 2px 12px var(--green-glow);
+}
+.dc-green:hover { filter: brightness(1.1); transform: translateY(-1px); }
+.dc-red {
+  background: linear-gradient(135deg, #7a1a1a, #e53935);
+  color: #fff;
+  box-shadow: 0 2px 12px var(--red-glow);
+}
+.dc-red:hover { filter: brightness(1.1); transform: translateY(-1px); }
+.dc-gray {
+  background: rgba(255,255,255,0.06);
+  border: 1px solid var(--border2);
+  color: var(--text2);
+}
+.dc-gray:hover { background: rgba(255,255,255,0.1); color: var(--text); }
+
+.dc-btn-full {
+  width: 100%;
+  padding: 9px;
+  border-radius: 8px;
+  border: none;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+/* لیست‌آیتم داخل کارت */
+.dc-list-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text2);
+  cursor: pointer;
+  transition: all 0.2s;
+  position: relative;
+}
+.dc-list-item:hover { background: rgba(108,79,255,0.1); color: var(--text); border-color: var(--accent); }
+
+.dc-badge {
+  margin-right: auto;
+  background: rgba(229,57,53,0.2);
+  color: #ff8a80;
+  border-radius: 100px;
+  padding: 1px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  display: inline-block;
+}
+.dc-badge-green { background: rgba(29,185,84,0.2); color: #69f0ae; }
+
+/* اینپوت داخل کارت */
+.dc-input-row { display: flex; gap: 6px; }
+.dc-tool-row { display: flex; gap: 6px; align-items: center; }
+.dc-input {
+  flex: 1;
+  padding: 8px 10px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border2);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.2s;
+  min-width: 0;
+}
+.dc-input:focus { border-color: var(--accent); }
+
+.dc-icon-btn {
+  width: 34px; height: 34px;
+  flex-shrink: 0;
+  background: linear-gradient(135deg, var(--accent), #a855f7);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 15px;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.2s;
+}
+.dc-icon-btn:hover { filter: brightness(1.15); transform: translateY(-1px); }
+
+/* ─── تاگل سوئیچ ─── */
+.dc-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.02);
+  font-size: 12px;
+  color: var(--text2);
+  transition: background 0.2s;
+}
+.dc-toggle-row:hover { background: rgba(255,255,255,0.05); }
+
+.tgl { position: relative; width: 40px; height: 22px; flex-shrink: 0; }
+.tgl input { opacity: 0; width: 0; height: 0; position: absolute; }
+.tgl-s {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background: var(--bg);
+  border: 1px solid var(--border2);
+  border-radius: 22px;
+  transition: all 0.3s;
+}
+.tgl-s::before {
+  content: "";
+  position: absolute;
+  height: 14px; width: 14px;
+  right: 3px; bottom: 3px;
+  background: var(--text3);
+  border-radius: 50%;
+  transition: all 0.3s;
+}
+.tgl input:checked + .tgl-s {
+  background: var(--blue);
+  border-color: var(--blue);
+  box-shadow: 0 0 10px var(--blue-glow);
+}
+.tgl input:checked + .tgl-s::before {
+  background: #fff;
+  right: auto;
+  left: 3px;
+}
+
+/* ─── کارت‌باکس (بخش‌های دیگر) ─── */
+.card-box {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-bottom: 16px;
+}
+.cb-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ─── اینپوت‌های عمومی ─── */
+input[type="text"],
+input[type="number"],
+input[type="password"],
+input[type="tel"],
+textarea,
+select {
+  width: 100%;
+  padding: 10px 14px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
+  direction: rtl;
+}
+input:focus, textarea:focus, select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+textarea { resize: vertical; min-height: 80px; }
+select { cursor: pointer; }
+
+/* ─── تب‌بار ─── */
+.tabs-bar {
+  display: flex;
+  gap: 4px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 4px;
+  margin-bottom: 16px;
+}
+.tab-btn {
+  flex: 1;
+  padding: 8px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--text2);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.tab-btn.active { background: var(--card2); color: var(--purple); }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* ─── دکمه‌ها ─── */
+.btn-pri {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 18px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-pri:hover { background: var(--accent2); transform: translateY(-1px); }
+
+.btn-dng {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 18px;
+  background: rgba(229,57,53,0.12);
+  color: #ff6b6b;
+  border: 1px solid rgba(229,57,53,0.25);
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-dng:hover { background: rgba(229,57,53,0.22); }
+.btn-sm { padding: 5px 12px; font-size: 11px; }
+
+/* ─── input-row ─── */
+.input-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.input-row input { flex: 1; min-width: 140px; }
+
+/* ─── جدول ─── */
+.table-wrap { overflow-x: auto; border-radius: var(--radius-sm); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th {
+  padding: 10px 14px;
+  background: var(--bg2);
+  color: var(--text2);
+  font-size: 11px;
+  font-weight: 700;
+  text-align: right;
+  border-bottom: 1px solid var(--border);
+}
+td { padding: 10px 14px; border-bottom: 1px solid var(--border); color: var(--text); }
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: rgba(255,255,255,0.02); }
+.tbl-empty { text-align: center; color: var(--text3); padding: 24px; }
+code { background: var(--bg3); padding: 2px 8px; border-radius: 4px; font-family: monospace; font-size: 11px; color: var(--purple); }
+
+/* ─── تنظیمات ─── */
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+/* ─── راهنما ─── */
+.guide-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 14px;
+}
+.guide-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+.guide-card h4 {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--purple);
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.guide-cmd {
+  font-size: 12px;
+  color: var(--text2);
+  padding: 4px 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.guide-cmd code { color: var(--accent2); background: rgba(108,79,255,0.1); }
+
+/* ─── بج ─── */
+.badge-blue {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  background: rgba(41,121,255,0.15);
+  color: #82b4ff;
+  border-radius: 100px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* ─── فوتر ─── */
+.panel-footer {
+  padding: 14px 28px;
+  border-top: 1px solid var(--border);
+  text-align: center;
+  font-size: 12px;
+  color: var(--text3);
+  background: var(--bg2);
+}
+
+/* ─── توست ─── */
+.toast-wrap {
+  position: fixed;
+  bottom: 20px;
+  left: 20px;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.toast {
+  padding: 11px 18px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+  animation: toast-in 0.3s ease;
+  max-width: 280px;
+  border-right: 3px solid transparent;
+}
+.toast-success { background: #0d3321; border-color: var(--green); color: #69f0ae; }
+.toast-error   { background: #2d0f0f; border-color: var(--red); color: #ff8a80; }
+.toast-info    { background: #0d1633; border-color: var(--blue); color: #82b4ff; }
+@keyframes toast-in { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:none; } }
+
+/* ─── موبایل ─── */
+.mob-header {
+  display: none;
+  position: sticky;
+  top: 0;
+  z-index: 999;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 16px;
+  align-items: center;
+  gap: 12px;
+  min-height: 56px;
+}
+.mob-hamburger {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 28px;
+  cursor: pointer;
+  padding: 8px 12px;
+  min-width: 48px;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.mob-title { 
+  font-weight: 800; 
+  font-size: 16px; 
+  color: var(--text);
+  flex: 1;
+}
+.mob-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.7);
+  z-index: 90;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+.mob-overlay.open { display: block; }
+
+@media (max-width: 860px) {
+  .mob-header { 
+    display: flex; 
+  }
+
+  .sidebar {
+    transform: translateX(100%);
+    width: 85vw;
+    max-width: 300px;
+    z-index: 100;
+    box-shadow: -4px 0 30px rgba(0,0,0,0.5);
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .sidebar.open { 
+    transform: translateX(0);
+  }
+
+  .main-area { 
+    margin-right: 0;
+    width: 100%;
+  }
+
+  .panel-header { 
+    display: none; 
+  }
+
+  .section { 
+    padding: 12px 10px; 
+  }
+  
+  .sec-header h2 { 
+    font-size: 16px; 
+  }
+
+  .dash-grid { 
+    grid-template-columns: 1fr; 
+    gap: 10px; 
+  }
+
+  .dash-card .dc-body { 
+    padding: 10px; 
+  }
+  .dc-btn { 
+    font-size: 13px; 
+    padding: 10px 8px; 
+    min-height: 44px;
+  }
+  .dc-btn-full { 
+    font-size: 13px; 
+    padding: 10px 8px; 
+    min-height: 44px;
+  }
+  
+  .dc-list-item {
+    padding: 10px 12px;
+    min-height: 44px;
+    font-size: 13px;
+  }
+
+  .dc-token-stats { 
+    gap: 8px; 
+    flex-wrap: wrap;
+  }
+  .dc-token-stat { 
+    padding: 8px 12px; 
+    min-width: 80px;
+    flex: 1;
+  }
+  .dc-token-big { 
+    font-size: 28px; 
+  }
+  .dc-token-med { 
+    font-size: 20px; 
+  }
+  .dc-token-actions { 
+    gap: 6px; 
+    flex-direction: column;
+  }
+  .dc-token-actions .dc-btn-full { 
+    min-width: unset;
+    min-height: 44px;
+    font-size: 14px;
+  }
+
+  .input-row { 
+    flex-direction: column; 
+    gap: 8px;
+  }
+  .input-row input, 
+  .input-row button { 
+    width: 100%; 
+    min-height: 44px;
+  }
+  
+  .input-row .btn-pri,
+  .input-row .btn-dng {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .auth-card { 
+    padding: 20px 16px; 
+  }
+  .auth-title { 
+    font-size: 22px; 
+  }
+  .auth-input { 
+    font-size: 16px; 
+    padding: 12px;
+    min-height: 48px;
+  }
+  .auth-btn { 
+    font-size: 16px; 
+    padding: 14px;
+    min-height: 48px;
+  }
+
+  .sb-logout {
+    min-height: 44px;
+    font-size: 14px;
+  }
+  
+  .tgl { 
+    width: 48px; 
+    height: 26px; 
+  }
+  .tgl-s::before {
+    height: 18px; 
+    width: 18px;
+    right: 3px; 
+    bottom: 3px;
+  }
+  .tgl input:checked + .tgl-s::before {
+    left: 3px;
+    right: auto;
+  }
+
+  .tabs-bar {
+    flex-wrap: wrap;
+  }
+  .tab-btn {
+    flex: 1;
+    min-width: 80px;
+    min-height: 44px;
+    font-size: 14px;
+  }
+
+  .dc-btn-row {
+    flex-direction: column;
+    gap: 6px;
+  }
+  .dc-btn {
+    width: 100%;
+  }
+
+  .btn-pri, .btn-dng {
+    padding: 10px 16px;
+    min-height: 44px;
+    justify-content: center;
+    font-size: 14px;
+  }
+  
+  .ph-tokens {
+    padding: 4px 10px;
+    font-size: 12px;
+  }
+  .ph-token-num {
+    font-size: 16px;
+    min-width: 20px;
+  }
+  .ph-token-label {
+    font-size: 10px;
+  }
+}
+
+/* صفحات خیلی کوچک (مثل آیفون SE) */
+@media (max-width: 420px) {
+  .dash-grid { gap: 8px; }
+  .section { padding: 8px 6px; }
+  .dc-token-stats { flex-direction: column; align-items: stretch; }
+  .dc-token-actions .dc-btn-full { min-width: unset; }
+  .auth-card { padding: 16px 12px; }
+  .auth-title { font-size: 20px; }
+}
+
+/* ─── سیستم الماس ─── */
+.ph-tokens {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(234,179,8,0.12);
+  border: 1px solid rgba(234,179,8,0.3);
+  border-radius: 10px;
+  padding: 6px 14px;
+  white-space: nowrap;
+}
+.ph-token-icon { font-size: 18px; }
+.ph-token-num {
+  font-size: 20px;
+  font-weight: 800;
+  color: #facc15;
+  min-width: 28px;
+  text-align: center;
+}
+.ph-token-label { font-size: 12px; color: #a0890a; font-weight: 600; }
+
+.dc-token-card {
+  grid-column: 1 / -1;
+  background: linear-gradient(135deg, #1a1600 0%, #0f1a0a 50%, #0a0f1a 100%);
+  border-color: rgba(234,179,8,0.2);
+}
+.dc-header-gold {
+  background: linear-gradient(135deg, rgba(234,179,8,0.15), rgba(16,185,129,0.1));
+  border-bottom-color: rgba(234,179,8,0.2);
+  color: #facc15;
+}
+.dc-token-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.dc-token-stats {
+  display: flex;
+  gap: 20px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.dc-token-stat {
+  text-align: center;
+  padding: 12px 24px;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 12px;
+  min-width: 120px;
+}
+.dc-token-big {
+  font-size: 40px;
+  font-weight: 900;
+  color: #facc15;
+  line-height: 1;
+  margin-bottom: 4px;
+}
+.dc-token-med {
+  font-size: 28px;
+  font-weight: 800;
+  color: #a78bfa;
+  line-height: 1;
+  margin-bottom: 4px;
+}
+.dc-token-sub {
+  font-size: 12px;
+  color: #6b7280;
+  font-weight: 500;
+}
+.dc-token-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.dc-token-actions .dc-btn-full { flex: 1; min-width: 140px; }
+.dc-gold {
+  background: linear-gradient(135deg, #92400e, #78350f);
+  color: #fbbf24;
+  border: 1px solid rgba(251,191,36,0.3);
+}
+.dc-gold:hover { background: linear-gradient(135deg, #b45309, #92400e); }
+.dc-cyan {
+  background: linear-gradient(135deg, #0e4d5a, #083344);
+  color: #67e8f9;
+  border: 1px solid rgba(103,232,249,0.3);
+}
+.dc-cyan:hover { background: linear-gradient(135deg, #155e75, #0e4d5a); }
+.dc-purple {
+  background: linear-gradient(135deg, #4c1d95, #3b0764);
+  color: #c4b5fd;
+  border: 1px solid rgba(196,181,253,0.3);
+}
+.dc-purple:hover { background: linear-gradient(135deg, #5b21b6, #4c1d95); }
+.dc-token-info-bar {
+  font-size: 12px;
+  color: #6b7280;
+  text-align: center;
+  padding: 10px 16px;
+  background: rgba(255,255,255,0.02);
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.04);
+  line-height: 2;
+}
+.dc-token-info-bar b { color: #a78bfa; }
